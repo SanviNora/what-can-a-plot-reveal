@@ -1,0 +1,130 @@
+"""Generate every Slurm job script from one template, so all jobs share the same safety features.
+
+  python make_jobs.py        (run by make_bundle.sh; do not edit the .sbatch files by hand)
+
+Every job: prints the code VERSION and stops if it is missing; checks its inputs exist before starting; runs code only
+from the unzipped bundle ($CODE), never from the upload folder; returns a real failure code (pipefail + FAIL flag)
+so dependent jobs are cancelled instead of starting on bad input; is requeued automatically if its cloud node dies.
+Jobs take the run folder name as their first argument (e.g. v4_synthetic, confirm_synthetic).
+"""
+import pathlib
+
+HERE = pathlib.Path(__file__).parent
+ACCOUNT = "ds_ga_1006_001-2026fa"
+CPU = dict(partition="n2c48m24", extra="#SBATCH --cpus-per-task=24\n#SBATCH --mem=22G")
+GPU = dict(partition="c12m85-a100-1", extra="#SBATCH --gres=gpu:1\n#SBATCH --cpus-per-task=10\n#SBATCH --mem=70G")
+
+PREAMBLE = r'''set -o pipefail
+BASE=${SCRATCH:-$HOME}/visml
+CODE=$BASE/code
+SIF=/share/apps/images/cuda13.0.1-cudnn9.13.0-ubuntu-24.04.3.sif
+OVL=$BASE/overlay-25GB-500K.ext3:ro
+export HF_HOME=$BASE/hf_cache TORCH_HOME=$BASE/torch_cache SCIKIT_LEARN_DATA=$BASE/sklearn_data
+FILTER="Capturing CUDA graphs|Loading safetensors|Loading pt checkpoint|Prefetching checkpoint|triton_bundler|torch/_inductor|ResourceTracker|resource_tracker|ChildProcessError|Exception ignored|UserWarning|warnings.warn"
+[ -f $CODE/VERSION ] || { echo "FATAL: no $CODE/VERSION — unzip visml_bundle.zip first"; exit 2; }
+echo "job $SLURM_JOB_ID ($SLURM_JOB_NAME) on $(hostname) at $(date) — code version $(cat $CODE/VERSION) — args: $*"
+need() { for f in "$@"; do [ -e "$f" ] || { echo "FATAL: missing input $f"; exit 3; }; done; }
+py()  { singularity exec --nv --overlay $OVL $SIF /bin/bash -c "source /ext3/env.sh; cd $CODE && python -u $*" 2>&1 | grep --line-buffered -v -E "$FILTER"; }
+vlm() { singularity exec --nv --overlay $OVL $SIF /bin/bash -c "cd $CODE && /ext3/envs/vllm/bin/python -u hpc/vlm_read.py $*" 2>&1 | grep --line-buffered -v -E "$FILTER"; }
+FAIL=0
+'''
+
+JOBS = {
+    "cpu": (CPU, "16:00:00", "Train, calibrate, render, B0/B1 benchmarks, reader items. Args: RUN SOURCE SIZE SEEDTAG", r'''
+RUN=${1:?RUN}; SRC=${2:?SOURCE}; SIZE=${3:-full}; TAG=${4:-}
+py run_v4.py --source $SRC --name $RUN --size $SIZE ${TAG:+--seed-tag $TAG} --jobs 24 || FAIL=1
+need $CODE/runs/$RUN/features.npz $CODE/runs/$RUN/results.json $CODE/runs/$RUN/reader_items.json
+'''),
+    "b2": (GPU, "10:00:00", "Image benchmark B2 (ResNet-18). Args: RUN", r'''
+RUN=${1:?RUN}
+need $CODE/runs/$RUN/meta.json $CODE/runs/$RUN/img
+py hpc/b2_v4.py runs/$RUN || FAIL=1
+need $CODE/runs/$RUN/b2_results.json
+'''),
+    "readers": (GPU, "16:00:00", "AI readers. Args: RUN then ITEMS:TAG:MODEL ... (TAG '-' = none)", r'''
+RUN=${1:?RUN}; shift
+for spec in "$@"; do
+  IFS=: read -r ITEMS TAG M <<< "$spec"; [ "$TAG" = "-" ] && TAG=""
+  need $CODE/runs/$RUN/$ITEMS
+  echo "===== $M on $ITEMS ${TAG:+(tag $TAG)} ====="
+  vlm $CODE/runs/$RUN $M $ITEMS $TAG || { echo "FAILED: $M on $ITEMS"; FAIL=1; }
+done
+'''),
+    "iv_cpu": (CPU, "03:00:00", "Design interventions from the run's evidential map. Args: RUN", r'''
+RUN=${1:?RUN}; R=$CODE/runs/$RUN
+need $R/meta.json $R/results.json $R/b2_results.json $R/manifest.jsonl $R/reader_items_variants.json $R/img
+py interventions.py runs/$RUN || FAIL=1
+need $R/reader_items_interventions.json $R/companion_benchmarks.json
+'''),
+    "pos_cpu": (CPU, "03:00:00", "Positive control (blatant cases) + value-probe items on confirm_synthetic. No args", r'''
+R=$CODE/runs; C=$R/confirm_synthetic
+need $CODE/make_positive.py $C/manifest.jsonl $C/meta.json $C/reader_items_core.json $C/img
+py make_positive.py positive --out runs/positive --n 50 --jobs 24 || FAIL=1
+py make_positive.py probe --run runs/confirm_synthetic --jobs 24 || FAIL=1
+need $R/positive/reader_items.json $R/positive/truth.json $C/reader_items_probe.json $C/probe_truth.json
+'''),
+    "rw_cpu": (CPU, "02:00:00", "Real-world check: apply the confirmatory B1 benchmarks to real-world plots. No args", r'''
+R=$CODE/runs
+need $CODE/rw_transfer.py $R/confirm_synthetic/features.npz $R/confirm_synthetic/results.json $R/realworld/features.npz $R/realworld/cases.json
+py rw_transfer.py runs/confirm_synthetic runs/realworld || FAIL=1
+need $R/realworld/transfer.json
+'''),
+    "rtr_cpu": (CPU, "02:00:00", "Read-then-reason prep (exact values + extraction items) and proportion-based transfer. No args", r'''
+R=$CODE/runs
+need $CODE/rtr.py $CODE/rtr_prepare.py $R/confirm_synthetic/features.npz $R/confirm_synthetic/reader_items_core.json $R/positive/reader_items.json $R/realworld/reader_items.json $R/realworld/features.npz
+py rtr_prepare.py runs/confirm_synthetic runs/positive runs/realworld || FAIL=1
+py rw_transfer.py runs/confirm_synthetic runs/realworld --proportions || FAIL=1
+need $R/confirm_synthetic/rtr_values.json $R/confirm_synthetic/reader_items_extract.json $R/positive/reader_items_extract.json $R/realworld/reader_items_extract.json $R/realworld/transfer_prop.json
+'''),
+    "ann_cpu": (CPU, "01:00:00", "Gap 5: render annotated (machine-reader) designs + reader items on confirm_synthetic. No args", r'''
+R=$CODE/runs/confirm_synthetic
+need $CODE/annotate.py $CODE/gaps_prepare.py $R/features.npz $R/reader_items_core.json
+py gaps_prepare.py ann runs/confirm_synthetic || FAIL=1
+need $R/reader_items_ann.json $R/img_ann
+'''),
+    "sets_cpu": (CPU, "08:00:00", "Gap 3: multi-plot diagnosis benchmark on both confirmatory runs. No args", r'''
+need $CODE/gaps_prepare.py $CODE/runs/confirm_synthetic/features.npz $CODE/runs/confirm_magic/features.npz
+py gaps_prepare.py sets runs/confirm_synthetic --jobs=8 || FAIL=1
+py gaps_prepare.py sets runs/confirm_magic --jobs=8 || FAIL=1
+need $CODE/runs/confirm_synthetic/plotsets.json $CODE/runs/confirm_magic/plotsets.json
+'''),
+    "rev_cpu": (CPU, "03:00:00", "Robustness checks: kernel two-sample tests (both runs) + binary/2AFC reader items. No args", r'''
+R=$CODE/runs
+need $CODE/review_prepare.py $R/confirm_synthetic/features.npz $R/confirm_magic/features.npz $R/confirm_synthetic/reader_items_core.json $R/confirm_synthetic/img
+py review_prepare.py items runs/confirm_synthetic || FAIL=1
+need $R/confirm_synthetic/reader_items_binary.json $R/confirm_synthetic/reader_items_2afc.json $R/confirm_synthetic/img_2afc
+py review_prepare.py mmd runs/confirm_synthetic runs/confirm_magic || FAIL=1
+need $R/confirm_synthetic/two_sample.json $R/confirm_magic/two_sample.json
+'''),
+    "items_cpu": (CPU, "01:00:00", "Simpler reader tasks on another run: binary/2AFC reader items. Args: RUN", r'''
+RUN=${1:?RUN}
+need $CODE/review_prepare.py $CODE/runs/$RUN/meta.json $CODE/runs/$RUN/reader_items_core.json $CODE/runs/$RUN/img
+py review_prepare.py items runs/$RUN || FAIL=1
+need $CODE/runs/$RUN/reader_items_binary.json $CODE/runs/$RUN/reader_items_2afc.json $CODE/runs/$RUN/img_2afc
+'''),
+    "dataset_cpu": (CPU, "02:00:00", "Public plot dataset: zip of the reader-item plots with labels. Args: RUN", r'''
+RUN=${1:?RUN}; R=$CODE/runs/$RUN
+need $CODE/make_dataset.py $R/meta.json $R/reader_items.json $R/reader_items_core.json $R/img
+py make_dataset.py runs/$RUN || FAIL=1
+need $R/plotreveal_$RUN.zip
+'''),
+    "b3": (GPU, "08:00:00", "Stronger image benchmark B3 (ConvNeXt-Tiny, native resolution). Args: RUN", r'''
+RUN=${1:?RUN}
+need $CODE/runs/$RUN/meta.json $CODE/runs/$RUN/img
+py hpc/b3_strong.py runs/$RUN || FAIL=1
+need $CODE/runs/$RUN/b3_results.json
+'''),
+}
+
+for name, (res, time, doc, body) in JOBS.items():
+    head = (f"#!/bin/bash\n#SBATCH --job-name={name.replace('_', '-')}\n#SBATCH --account={ACCOUNT}\n"
+            f"#SBATCH --output=%x-%j.out\n#SBATCH --open-mode=append\n#SBATCH --requeue\n"
+            f"#SBATCH --partition={res['partition']}\n{res['extra']}\n#SBATCH --time={time}\n"
+            f"# {doc}\n# GENERATED by make_jobs.py — do not edit by hand.\n")
+    (HERE / f"{name}.sbatch").write_text(head + PREAMBLE + body.lstrip("\n") +
+                                         'echo "===== finished: FAIL=$FAIL ====="\nexit $FAIL\n')
+    print("wrote", name + ".sbatch")
+for old in HERE.glob("*.sbatch"):
+    if old.stem not in JOBS:
+        old.rename(HERE / "archive" / old.name)
+        print("archived", old.name)
